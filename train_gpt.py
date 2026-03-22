@@ -86,6 +86,14 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # BigramHash: inject token-pair context via a hash-table embedding.
+    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 0))
+    bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
+
+    # Keep USE_SMEARGATE for backward compatibility; internally uses AdaptiveContextMixer.
+    use_smeargate = bool(int(os.environ.get("USE_SMEARGATE", "0")))
+    adaptive_mixer_hidden_dim = int(os.environ.get("ADAPTIVE_MIXER_HIDDEN_DIM", max(32, model_dim // 8)))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -645,6 +653,51 @@ class Block(nn.Module):
         return x
 
 
+class BigramHash(nn.Module):
+    """Hash-table embedding for token bigrams, projected to model dim."""
+    def __init__(self, num_buckets: int, hash_dim: int, model_dim: int):
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.table = nn.Embedding(num_buckets, hash_dim)
+        self.proj = CastedLinear(hash_dim, model_dim, bias=False)
+        self.proj._zero_init = True
+        nn.init.normal_(self.table.weight, std=0.01)
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        bsz, _ = input_ids.shape
+        prev_ids = torch.cat(
+            [torch.zeros(bsz, 1, dtype=input_ids.dtype, device=input_ids.device), input_ids[:, :-1]],
+            dim=1,
+        )
+        h = ((prev_ids.long() * 92821 + input_ids.long()) % self.num_buckets).long()
+        return self.proj(self.table(h))
+
+
+class AdaptiveContextMixer(nn.Module):
+    """Adaptive short-range mixer that learns when previous-token carryover helps."""
+
+    def __init__(self, dim: int, hidden_dim: int):
+        super().__init__()
+        self.in_proj = CastedLinear(dim * 3, hidden_dim, bias=True)
+        self.out_proj = CastedLinear(hidden_dim, dim, bias=True)
+        nn.init.zeros_(self.out_proj.weight)
+        # Start near pass-through and learn when local carryover improves predictions.
+        nn.init.constant_(self.out_proj.bias, math.log(0.05 / 0.95))
+
+    def _shift_prev(self, x: Tensor) -> Tensor:
+        return torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+
+    def _build_features(self, x: Tensor, prev: Tensor) -> Tensor:
+        return torch.cat((x, prev, x - prev), dim=-1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        prev = self._shift_prev(x)
+        feats = self._build_features(x, prev)
+        hidden = F.silu(self.in_proj(feats))
+        alpha = torch.sigmoid(self.out_proj(hidden))
+        return x + alpha * (prev - x)
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -659,6 +712,10 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        bigram_hash_buckets: int = 0,
+        bigram_hash_dim: int = 128,
+        use_smeargate: bool = True,
+        adaptive_mixer_hidden_dim: int | None = None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -667,6 +724,10 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.bigram_hash = BigramHash(bigram_hash_buckets, bigram_hash_dim, model_dim) if bigram_hash_buckets > 0 else None
+        mixer_hidden = adaptive_mixer_hidden_dim or max(32, model_dim // 8)
+        self.local_mixer = AdaptiveContextMixer(model_dim, mixer_hidden) if use_smeargate else None
+        self.smeargate = self.local_mixer  # backward-compat alias
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -699,6 +760,10 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.bigram_hash is not None:
+            x = x + self.bigram_hash(input_ids)
+        if self.local_mixer is not None:
+            x = self.local_mixer(x)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -835,6 +900,10 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        bigram_hash_buckets=args.bigram_hash_buckets,
+        bigram_hash_dim=args.bigram_hash_dim,
+        use_smeargate=args.use_smeargate,
+        adaptive_mixer_hidden_dim=args.adaptive_mixer_hidden_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -862,8 +931,15 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    embed_params = [base_model.tok_emb.weight]
+    if base_model.bigram_hash is not None:
+        embed_params.append(base_model.bigram_hash.table.weight)
+        matrix_params.append(base_model.bigram_hash.proj.weight)
+    if base_model.local_mixer is not None:
+        matrix_params.extend([base_model.local_mixer.in_proj.weight, base_model.local_mixer.out_proj.weight])
+        scalar_params.extend([base_model.local_mixer.in_proj.bias, base_model.local_mixer.out_proj.bias])
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": embed_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
