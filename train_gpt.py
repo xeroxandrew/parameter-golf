@@ -48,11 +48,13 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    val_max_tokens = int(os.environ.get("VAL_MAX_TOKENS", 0))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    lr_warmup_iters = int(os.environ.get("LR_WARMUP_ITERS", 200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -93,6 +95,20 @@ class Hyperparameters:
     # Keep USE_SMEARGATE for backward compatibility; internally uses AdaptiveContextMixer.
     use_smeargate = bool(int(os.environ.get("USE_SMEARGATE", "1")))
     adaptive_mixer_hidden_dim = int(os.environ.get("ADAPTIVE_MIXER_HIDDEN_DIM", max(32, model_dim // 8)))
+    local_mixer_matrix_lr_mult = float(os.environ.get("LOCAL_MIXER_MATRIX_LR_MULT", 0.5))
+    local_mixer_scalar_lr_mult = float(os.environ.get("LOCAL_MIXER_SCALAR_LR_MULT", 0.5))
+
+    # Single-GPU throughput knobs.
+    loader_pin_memory = bool(int(os.environ.get("LOADER_PIN_MEMORY", "1")))
+    loader_prefetch = bool(int(os.environ.get("LOADER_PREFETCH", "1")))
+    auto_grad_accum = bool(int(os.environ.get("AUTO_GRAD_ACCUM", "0")))
+    auto_grad_accum_candidates = os.environ.get("AUTO_GRAD_ACCUM_CANDIDATES", "1,2,4,8")
+    auto_grad_accum_bench_steps = int(os.environ.get("AUTO_GRAD_ACCUM_BENCH_STEPS", 1))
+
+    # Optional EMA tail averaging.
+    ema_start_step = int(os.environ.get("EMA_START_STEP", 0))
+    ema_update_every = int(os.environ.get("EMA_UPDATE_EVERY", 1))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.999))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -235,6 +251,7 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    max_eval_tokens: int = 0,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -247,7 +264,20 @@ def eval_val(
             f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
         )
     local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    usable_tokens = val_tokens.numel() - 1
+    if max_eval_tokens > 0:
+        usable_tokens = min(usable_tokens, max_eval_tokens)
+    usable_tokens = (usable_tokens // args.train_seq_len) * args.train_seq_len
+    if usable_tokens <= 0:
+        raise ValueError(
+            f"Validation token budget too small: max_eval_tokens={max_eval_tokens}, TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+    total_seqs = usable_tokens // args.train_seq_len
+    if total_seqs < world_size:
+        raise ValueError(
+            f"Validation token budget too small for WORLD_SIZE={world_size}: total_seqs={total_seqs}. "
+            f"Increase VAL_MAX_TOKENS or reduce WORLD_SIZE."
+        )
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -485,13 +515,25 @@ class TokenStream:
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+    def __init__(
+        self,
+        pattern: str,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        pin_memory: bool = True,
+        prefetch: bool = True,
+    ):
         self.rank = rank
         self.world_size = world_size
         self.device = device
+        self.pin_memory = pin_memory
+        self.prefetch = prefetch
         self.stream = TokenStream(pattern)
+        self._prefetch_key: tuple[int, int, int] | None = None
+        self._next_batch: tuple[Tensor, Tensor] | None = None
 
-    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+    def _build_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
         chunk = self.stream.take(per_rank_span * self.world_size)
@@ -499,7 +541,26 @@ class DistributedTokenLoader:
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
+        if self.pin_memory:
+            x = x.pin_memory()
+            y = y.pin_memory()
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+    def _prime_prefetch(self, key: tuple[int, int, int]) -> None:
+        self._prefetch_key = key
+        self._next_batch = self._build_batch(*key)
+
+    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        if not self.prefetch:
+            return self._build_batch(global_tokens, seq_len, grad_accum_steps)
+        key = (global_tokens, seq_len, grad_accum_steps)
+        if self._next_batch is None or self._prefetch_key != key:
+            self._prime_prefetch(key)
+        if self._next_batch is None:
+            raise RuntimeError("Prefetch state was unexpectedly empty")
+        batch = self._next_batch
+        self._prime_prefetch(key)
+        return batch
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -810,10 +871,16 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
-    grad_scale = 1.0 / grad_accum_steps
+    grad_accum_override = int(os.environ.get("GRAD_ACCUM_STEPS", "0"))
+    auto_grad_accum_enabled = args.auto_grad_accum and grad_accum_override <= 0
+    if grad_accum_override > 0:
+        grad_accum_steps = grad_accum_override
+    elif auto_grad_accum_enabled:
+        grad_accum_steps = 1
+    else:
+        if 8 % world_size != 0:
+            raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
+        grad_accum_steps = 8 // world_size
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda", local_rank)
@@ -857,6 +924,36 @@ def main() -> None:
         console=False,
     )
     log0("=" * 100, console=False)
+
+    def validate_grad_accum_steps(value: int) -> None:
+        if value <= 0:
+            raise ValueError(f"GRAD_ACCUM_STEPS must be positive, got {value}")
+        local_train_tokens = args.train_batch_tokens // (world_size * value)
+        if local_train_tokens < args.train_seq_len:
+            raise ValueError(
+                "TRAIN_BATCH_TOKENS is too small for the current WORLD_SIZE and GRAD_ACCUM_STEPS; "
+                f"got TRAIN_BATCH_TOKENS={args.train_batch_tokens}, WORLD_SIZE={world_size}, "
+                f"GRAD_ACCUM_STEPS={value}, TRAIN_SEQ_LEN={args.train_seq_len}"
+            )
+        if local_train_tokens % args.train_seq_len != 0:
+            raise ValueError(
+                "TRAIN_BATCH_TOKENS must yield an integer number of sequences per rank/micro-step; "
+                f"got local_train_tokens={local_train_tokens}, TRAIN_SEQ_LEN={args.train_seq_len}"
+            )
+
+    def parse_auto_grad_accum_candidates(raw: str) -> list[int]:
+        candidates: list[int] = []
+        for token in raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                value = int(token)
+            except ValueError:
+                continue
+            if value > 0:
+                candidates.append(value)
+        return sorted(set(candidates))
 
     # -----------------------------
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -909,6 +1006,69 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+
+    if auto_grad_accum_enabled:
+        candidates = parse_auto_grad_accum_candidates(args.auto_grad_accum_candidates)
+        valid_candidates = [
+            c
+            for c in candidates
+            if (args.train_batch_tokens // (world_size * c)) >= args.train_seq_len
+            and (args.train_batch_tokens // (world_size * c)) % args.train_seq_len == 0
+        ]
+        if not valid_candidates:
+            raise ValueError(
+                f"AUTO_GRAD_ACCUM found no valid candidates from {args.auto_grad_accum_candidates!r} "
+                f"for TRAIN_BATCH_TOKENS={args.train_batch_tokens}, WORLD_SIZE={world_size}, "
+                f"TRAIN_SEQ_LEN={args.train_seq_len}"
+            )
+        bench_steps = max(args.auto_grad_accum_bench_steps, 1)
+        best_steps = valid_candidates[0]
+        best_tokens_per_sec = 0.0
+        base_model.train()
+        for cand in valid_candidates:
+            local_tokens = args.train_batch_tokens // (world_size * cand)
+            local_batch_size = local_tokens // args.train_seq_len
+            x_bench = torch.randint(
+                0, args.vocab_size, (local_batch_size, args.train_seq_len), device=device, dtype=torch.int64
+            )
+            y_bench = torch.randint(
+                0, args.vocab_size, (local_batch_size, args.train_seq_len), device=device, dtype=torch.int64
+            )
+            tokens_per_second = 0.0
+            try:
+                base_model.zero_grad(set_to_none=True)
+                torch.cuda.synchronize()
+                t_bench = time.perf_counter()
+                for _ in range(bench_steps):
+                    base_model.zero_grad(set_to_none=True)
+                    for _ in range(cand):
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                            loss_bench = base_model(x_bench, y_bench)
+                        (loss_bench / cand).backward()
+                torch.cuda.synchronize()
+                elapsed = max(time.perf_counter() - t_bench, 1e-9)
+                tokens_per_second = (bench_steps * args.train_batch_tokens) / elapsed
+            except RuntimeError as e:
+                if "out of memory" not in str(e).lower():
+                    raise
+                torch.cuda.empty_cache()
+            finally:
+                base_model.zero_grad(set_to_none=True)
+            if distributed:
+                score = torch.tensor(tokens_per_second, device=device)
+                dist.all_reduce(score, op=dist.ReduceOp.MIN)
+                tokens_per_second = float(score.item())
+            if master_process:
+                log0(f"auto_grad_accum:candidate:{cand} tokens_per_sec:{tokens_per_second:.1f}")
+            if tokens_per_second > best_tokens_per_sec:
+                best_tokens_per_sec = tokens_per_second
+                best_steps = cand
+        grad_accum_steps = best_steps
+        if master_process:
+            log0(f"auto_grad_accum:selected:{grad_accum_steps} tokens_per_sec:{best_tokens_per_sec:.1f}")
+
+    validate_grad_accum_steps(grad_accum_steps)
+    grad_scale = 1.0 / grad_accum_steps
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -932,28 +1092,36 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     embed_params = [base_model.tok_emb.weight]
+    mixer_matrix_params: list[Tensor] = []
+    mixer_scalar_params: list[Tensor] = []
     if base_model.bigram_hash is not None:
         embed_params.append(base_model.bigram_hash.table.weight)
         matrix_params.append(base_model.bigram_hash.proj.weight)
     if base_model.local_mixer is not None:
-        matrix_params.extend([base_model.local_mixer.in_proj.weight, base_model.local_mixer.out_proj.weight])
-        scalar_params.extend([base_model.local_mixer.in_proj.bias, base_model.local_mixer.out_proj.bias])
+        mixer_matrix_params.extend([base_model.local_mixer.in_proj.weight, base_model.local_mixer.out_proj.weight])
+        mixer_scalar_params.extend([base_model.local_mixer.in_proj.bias, base_model.local_mixer.out_proj.bias])
     optimizer_tok = torch.optim.Adam(
         [{"params": embed_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
+    muon_param_groups = [{"params": matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}]
+    if mixer_matrix_params:
+        mixer_matrix_lr = args.matrix_lr * args.local_mixer_matrix_lr_mult
+        muon_param_groups.append({"params": mixer_matrix_params, "lr": mixer_matrix_lr, "base_lr": mixer_matrix_lr})
     optimizer_muon = Muon(
-        matrix_params,
+        muon_param_groups,
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
     )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
+    scalar_param_groups = [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}]
+    if mixer_scalar_params:
+        mixer_scalar_lr = args.scalar_lr * args.local_mixer_scalar_lr_mult
+        scalar_param_groups.append({"params": mixer_scalar_params, "lr": mixer_scalar_lr, "base_lr": mixer_scalar_lr})
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        scalar_param_groups,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -978,35 +1146,80 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    if mixer_matrix_params or mixer_scalar_params:
+        log0(
+            "local_mixer_lrs:"
+            f"matrix:{args.matrix_lr * args.local_mixer_matrix_lr_mult} "
+            f"scalar:{args.scalar_lr * args.local_mixer_scalar_lr_mult}"
+        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
-        f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
+        f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} lr_warmup_iters:{args.lr_warmup_iters} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(
+        f"validation:val_loss_every:{args.val_loss_every} "
+        f"val_max_tokens:{args.val_max_tokens if args.val_max_tokens > 0 else 'full'}"
+    )
+    log0(
+        f"loader:pin_memory:{args.loader_pin_memory} prefetch:{args.loader_prefetch} "
+        f"auto_grad_accum:{auto_grad_accum_enabled}"
+    )
+    if args.ema_start_step > 0:
+        log0(
+            f"ema:enabled start:{args.ema_start_step} "
+            f"every:{args.ema_update_every} decay:{args.ema_decay}"
+        )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_loader = DistributedTokenLoader(
+        args.train_files,
+        rank,
+        world_size,
+        device,
+        pin_memory=args.loader_pin_memory,
+        prefetch=args.loader_prefetch,
+    )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
+    ema_enabled = (
+        args.ema_start_step > 0
+        and args.ema_update_every > 0
+        and 0.0 < args.ema_decay < 1.0
+    )
+    ema_updates = 0
+    ema_params: dict[str, Tensor] = {}
+    if ema_enabled:
+        with torch.no_grad():
+            for name, param in base_model.named_parameters():
+                ema_params[name] = param.detach().clone()
+
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
+        warmup_scale = min((step + 1) / max(args.lr_warmup_iters, 1), 1.0) if args.lr_warmup_iters > 0 else 1.0
         if args.warmdown_iters <= 0:
-            return 1.0
+            return warmup_scale
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+            warmdown_scale = (
+                max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
+                if warmdown_start <= step < args.iterations
+                else 1.0
+            )
+            return warmup_scale * warmdown_scale
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        warmdown_scale = remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        return warmup_scale * warmdown_scale
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1034,7 +1247,14 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_loader = DistributedTokenLoader(
+            args.train_files,
+            rank,
+            world_size,
+            device,
+            pin_memory=args.loader_pin_memory,
+            prefetch=args.loader_prefetch,
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1053,6 +1273,7 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            eval_budget = 0 if last_step else args.val_max_tokens
             val_loss, val_bpb = eval_val(
                 args,
                 model,
@@ -1064,9 +1285,11 @@ def main() -> None:
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
+                max_eval_tokens=eval_budget,
             )
+            val_scope = "full" if eval_budget <= 0 else f"subset:{eval_budget}"
             log0(
-                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} val_scope:{val_scope} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
@@ -1110,6 +1333,11 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+        if ema_enabled and step >= args.ema_start_step and step % args.ema_update_every == 0:
+            with torch.no_grad():
+                for name, param in base_model.named_parameters():
+                    ema_params[name].mul_(args.ema_decay).add_(param.detach(), alpha=1.0 - args.ema_decay)
+            ema_updates += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1129,6 +1357,18 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
+
+    if ema_enabled:
+        if ema_updates > 0:
+            with torch.no_grad():
+                for name, param in base_model.named_parameters():
+                    param.copy_(ema_params[name])
+            log0(
+                f"ema_applied:updates:{ema_updates} start:{args.ema_start_step} "
+                f"decay:{args.ema_decay} every:{args.ema_update_every}"
+            )
+        else:
+            log0("ema_applied:updates:0 (no EMA update steps reached)")
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
@@ -1186,6 +1426,7 @@ def main() -> None:
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
+        max_eval_tokens=0,
     )
     torch.cuda.synchronize()
     log0(
