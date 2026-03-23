@@ -53,7 +53,7 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 2000))
     lr_warmup_iters = int(os.environ.get("LR_WARMUP_ITERS", 200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
@@ -95,9 +95,6 @@ class Hyperparameters:
     # Keep USE_SMEARGATE for backward compatibility; internally uses AdaptiveContextMixer.
     use_smeargate = bool(int(os.environ.get("USE_SMEARGATE", "1")))
     adaptive_mixer_hidden_dim = int(os.environ.get("ADAPTIVE_MIXER_HIDDEN_DIM", max(32, model_dim // 8)))
-    local_mixer_matrix_lr_mult = float(os.environ.get("LOCAL_MIXER_MATRIX_LR_MULT", 0.5))
-    local_mixer_scalar_lr_mult = float(os.environ.get("LOCAL_MIXER_SCALAR_LR_MULT", 0.5))
-
     # Single-GPU throughput knobs.
     loader_pin_memory = bool(int(os.environ.get("LOADER_PIN_MEMORY", "1")))
     loader_prefetch = bool(int(os.environ.get("LOADER_PREFETCH", "1")))
@@ -109,6 +106,14 @@ class Hyperparameters:
     ema_start_step = int(os.environ.get("EMA_START_STEP", 0))
     ema_update_every = int(os.environ.get("EMA_UPDATE_EVERY", 1))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.999))
+
+    # Optional early stopping on validation bpb and restore-best.
+    early_stop_patience = int(os.environ.get("EARLY_STOP_PATIENCE", 0))
+    early_stop_min_delta = float(os.environ.get("EARLY_STOP_MIN_DELTA", 0.0))
+    early_stop_start_step = int(os.environ.get("EARLY_STOP_START_STEP", 0))
+    restore_best_at_end = bool(int(os.environ.get("RESTORE_BEST_AT_END", "1")))
+    save_best_checkpoint = bool(int(os.environ.get("SAVE_BEST_CHECKPOINT", "1")))
+    best_checkpoint_path = os.environ.get("BEST_CHECKPOINT_PATH", "best_model.pt")
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -737,13 +742,13 @@ class BigramHash(nn.Module):
 class AdaptiveContextMixer(nn.Module):
     """Adaptive short-range mixer that learns when previous-token carryover helps."""
 
-    def __init__(self, dim: int, hidden_dim: int):
+    def __init__(self, dim: int, hidden_dim: int | None = None):
         super().__init__()
-        self.in_proj = CastedLinear(dim * 3, hidden_dim, bias=True)
-        self.out_proj = CastedLinear(hidden_dim, dim, bias=True)
-        nn.init.zeros_(self.out_proj.weight)
+        # Single linear gate keeps the mixer adaptive but cheaper and easier to tune.
+        self.alpha_proj = CastedLinear(dim * 3, dim, bias=True)
+        nn.init.zeros_(self.alpha_proj.weight)
         # Start near pass-through and learn when local carryover improves predictions.
-        nn.init.constant_(self.out_proj.bias, math.log(0.05 / 0.95))
+        nn.init.constant_(self.alpha_proj.bias, math.log(0.05 / 0.95))
 
     def _shift_prev(self, x: Tensor) -> Tensor:
         return torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
@@ -754,8 +759,7 @@ class AdaptiveContextMixer(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         prev = self._shift_prev(x)
         feats = self._build_features(x, prev)
-        hidden = F.silu(self.in_proj(feats))
-        alpha = torch.sigmoid(self.out_proj(hidden))
+        alpha = torch.sigmoid(self.alpha_proj(feats))
         return x + alpha * (prev - x)
 
 
@@ -1092,36 +1096,26 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     embed_params = [base_model.tok_emb.weight]
-    mixer_matrix_params: list[Tensor] = []
-    mixer_scalar_params: list[Tensor] = []
     if base_model.bigram_hash is not None:
         embed_params.append(base_model.bigram_hash.table.weight)
         matrix_params.append(base_model.bigram_hash.proj.weight)
     if base_model.local_mixer is not None:
-        mixer_matrix_params.extend([base_model.local_mixer.in_proj.weight, base_model.local_mixer.out_proj.weight])
-        mixer_scalar_params.extend([base_model.local_mixer.in_proj.bias, base_model.local_mixer.out_proj.bias])
+        matrix_params.append(base_model.local_mixer.alpha_proj.weight)
+        scalar_params.append(base_model.local_mixer.alpha_proj.bias)
     optimizer_tok = torch.optim.Adam(
         [{"params": embed_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
-    muon_param_groups = [{"params": matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}]
-    if mixer_matrix_params:
-        mixer_matrix_lr = args.matrix_lr * args.local_mixer_matrix_lr_mult
-        muon_param_groups.append({"params": mixer_matrix_params, "lr": mixer_matrix_lr, "base_lr": mixer_matrix_lr})
     optimizer_muon = Muon(
-        muon_param_groups,
+        matrix_params,
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
     )
-    scalar_param_groups = [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}]
-    if mixer_scalar_params:
-        mixer_scalar_lr = args.scalar_lr * args.local_mixer_scalar_lr_mult
-        scalar_param_groups.append({"params": mixer_scalar_params, "lr": mixer_scalar_lr, "base_lr": mixer_scalar_lr})
     optimizer_scalar = torch.optim.Adam(
-        scalar_param_groups,
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1146,12 +1140,6 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    if mixer_matrix_params or mixer_scalar_params:
-        log0(
-            "local_mixer_lrs:"
-            f"matrix:{args.matrix_lr * args.local_mixer_matrix_lr_mult} "
-            f"scalar:{args.scalar_lr * args.local_mixer_scalar_lr_mult}"
-        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} lr_warmup_iters:{args.lr_warmup_iters} "
@@ -1160,6 +1148,10 @@ def main() -> None:
     log0(
         f"validation:val_loss_every:{args.val_loss_every} "
         f"val_max_tokens:{args.val_max_tokens if args.val_max_tokens > 0 else 'full'}"
+    )
+    log0(
+        f"early_stop:patience:{args.early_stop_patience} min_delta:{args.early_stop_min_delta} "
+        f"start_step:{args.early_stop_start_step} restore_best:{args.restore_best_at_end}"
     )
     log0(
         f"loader:pin_memory:{args.loader_pin_memory} prefetch:{args.loader_prefetch} "
@@ -1265,6 +1257,32 @@ def main() -> None:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
+    best_step = -1
+    best_val_loss = float("inf")
+    best_val_bpb = float("inf")
+    best_state: dict[str, Tensor] | None = None
+    val_events_since_improve = 0
+
+    def maybe_capture_best(step_idx: int, val_loss: float, val_bpb: float) -> bool:
+        nonlocal best_step, best_val_loss, best_val_bpb, best_state, val_events_since_improve
+        improved = val_bpb < (best_val_bpb - args.early_stop_min_delta)
+        if improved:
+            best_step = step_idx
+            best_val_loss = val_loss
+            best_val_bpb = val_bpb
+            best_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+            val_events_since_improve = 0
+            if master_process and args.save_best_checkpoint:
+                torch.save(best_state, args.best_checkpoint_path)
+                log0(
+                    f"best_checkpoint_saved:step:{best_step} val_loss:{best_val_loss:.4f} "
+                    f"val_bpb:{best_val_bpb:.4f} path:{args.best_checkpoint_path}"
+                )
+            return True
+        if step_idx >= args.early_stop_start_step:
+            val_events_since_improve += 1
+        return False
+
     step = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
@@ -1292,6 +1310,14 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} val_scope:{val_scope} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            improved = maybe_capture_best(step, val_loss, val_bpb)
+            if not improved and args.early_stop_patience > 0 and step >= args.early_stop_start_step:
+                if val_events_since_improve >= args.early_stop_patience:
+                    log0(
+                        f"stopping_early: no_validation_improve patience:{args.early_stop_patience} "
+                        f"last_best_step:{best_step} best_val_bpb:{best_val_bpb:.4f} current_step:{step}"
+                    )
+                    break
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1369,6 +1395,13 @@ def main() -> None:
             )
         else:
             log0("ema_applied:updates:0 (no EMA update steps reached)")
+
+    if args.restore_best_at_end and best_state is not None:
+        base_model.load_state_dict(best_state, strict=True)
+        log0(
+            f"best_checkpoint_restored:step:{best_step} "
+            f"val_loss:{best_val_loss:.4f} val_bpb:{best_val_bpb:.4f}"
+        )
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
